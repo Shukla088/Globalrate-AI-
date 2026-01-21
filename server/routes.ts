@@ -5,6 +5,7 @@ import { storage } from "./storage";
 import { api } from "@shared/routes";
 import { z } from "zod";
 import OpenAI from "openai";
+import { randomUUID } from "crypto";
 
 const openai = new OpenAI({
   apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
@@ -25,7 +26,10 @@ export async function registerRoutes(
   
   app.post(api.chat.send.path, async (req, res) => {
     try {
-      const { message, sessionId } = api.chat.send.input.parse(req.body);
+      const { message, sessionId: incomingSessionId } = api.chat.send.input.parse(req.body);
+      
+      // SESSION HANDLING: Auto-generate if missing
+      const sessionId = incomingSessionId || randomUUID();
 
       // 1. Get Session History (Follow-up within session)
       const history = await storage.getMessages(sessionId);
@@ -46,20 +50,18 @@ export async function registerRoutes(
       const searchData = await performSearch(message);
 
       // 4. Construct System Prompt
-      const systemPrompt = `You are Globalrate AI, a real-time AI search and chat assistant. You provide accurate, source-backed answers in English, Hindi, or Hinglish.
+      const systemPrompt = `You are Globalrate AI, a real-time AI search and chat assistant. 
 
-RULES:
-- Maintain context for follow-up questions within the current session.
-- Provide concise, factual, research-grade answers.
-- Include sources with every response.
-- Do not hallucinate information.
+SESSION RULES:
+- Every chat message MUST belong to a session.
+- Maintain full conversation context inside the same session.
+- Do NOT share context across different sessions.
 - If asked who created you, reply exactly: "I was created by Shreesh Shukla."
 
 OUTPUT FORMAT (Respond ONLY in JSON):
 {
   "answer": "Your answer here",
-  "sources": ["source1.com", "source2.com"],
-  "session_id": "${sessionId}"
+  "sources": ["domain1.com", "domain2.com"]
 }
 
 Context Data:
@@ -78,22 +80,20 @@ ${searchData.results}
       });
 
       const responseContent = completion.choices[0].message.content;
-      let parsedResponse: { answer: string; sources: string[]; session_id: string };
+      let parsedResponse: { answer: string; sources: string[] };
       
       try {
         parsedResponse = JSON.parse(responseContent || "{}");
       } catch (e) {
         parsedResponse = {
           answer: responseContent || "Error generating response.",
-          sources: ["Internal Error"],
-          session_id: sessionId
+          sources: ["Internal Error"]
         };
       }
 
       if (!parsedResponse.sources || parsedResponse.sources.length === 0) {
         parsedResponse.sources = ["Live confirmed data is not available right now"];
       }
-      parsedResponse.session_id = sessionId;
 
       // 6. Save Assistant Message
       await storage.createMessage({
@@ -103,7 +103,11 @@ ${searchData.results}
         sources: parsedResponse.sources
       });
 
-      res.json(parsedResponse);
+      // Include session_id in JSON response for client
+      res.json({
+        ...parsedResponse,
+        session_id: sessionId
+      });
 
     } catch (error) {
       console.error("Chat error:", error);

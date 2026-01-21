@@ -8,7 +8,7 @@ export const api = {
       path: '/api/chat',
       input: z.object({
         message: z.string().min(1),
-        sessionId: z.string(),
+        sessionId: z.string().optional().nullable(),
       }),
       responses: {
         200: z.object({
