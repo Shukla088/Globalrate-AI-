@@ -11,14 +11,7 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
-// Helper function to perform web search (mocked or using env vars if available)
 async function performSearch(query: string): Promise<{ results: string; sources: string[] }> {
-  // In a real production app, you would integrate with Tavily, Google, or Bing API here.
-  // Since we don't have a guaranteed key, we will follow the fallback protocol.
-  
-  // Example of how one might implement it if a key existed:
-  // if (process.env.TAVILY_API_KEY) { ... }
-
   return {
     results: "Live confirmed data is not available right now.",
     sources: ["Live confirmed data is not available right now"]
@@ -32,115 +25,84 @@ export async function registerRoutes(
   
   app.post(api.chat.send.path, async (req, res) => {
     try {
-      const { message } = api.chat.send.input.parse(req.body);
+      const { message, sessionId } = api.chat.send.input.parse(req.body);
 
-      // 1. Save User Message
+      // 1. Get Session History (Follow-up within session)
+      const history = await storage.getMessages(sessionId);
+      const chatHistory = history.map(msg => ({
+        role: msg.role as "user" | "assistant",
+        content: msg.content
+      }));
+
+      // 2. Save User Message
       await storage.createMessage({
+        sessionId,
         role: "user",
         content: message,
         sources: null
       });
 
-      // 2. Perform Search (Real-time data gathering)
+      // 3. Perform Search
       const searchData = await performSearch(message);
 
-      // 3. Construct System Prompt
-      const systemPrompt = `You are Globalrate AI, a real-time AI search and answer engine similar to Perplexity AI.
+      // 4. Construct System Prompt
+      const systemPrompt = `You are Globalrate AI, a real-time AI search and chat assistant. You provide accurate, source-backed answers in English, Hindi, or Hinglish.
 
-PRIMARY ROLE
-- Act as a research-grade AI that combines reasoning with up-to-date web information.
-- Answer questions by first THINKING like a researcher, then RESPONDING like a journalist.
-- Accuracy and sources are more important than creativity.
+RULES:
+- Maintain context for follow-up questions within the current session.
+- Provide concise, factual, research-grade answers.
+- Include sources with every response.
+- Do not hallucinate information.
+- If asked who created you, reply exactly: "I was created by Shreesh Shukla."
 
-CORE BEHAVIOR
-- Always prioritize factual, verifiable information.
-- If live or confirmed data is unavailable, clearly say so.
-- Never hallucinate facts, numbers, or sources.
-- Maintain conversational context for follow-up questions.
-
-ANSWER STRATEGY (MANDATORY)
-1. Understand user intent (quick answer, research, news, tech, market, study).
-2. If the question requires fresh or real-world data:
-   - Treat it as a SEARCH query.
-   - Use provided Context Data below.
-3. Summarize only the most relevant information.
-4. Keep answers concise, structured, and neutral.
-
-SOURCES (STRICT RULE)
-- Every answer MUST include sources.
-- Sources must be real, reputable domains (news sites, official docs, research, govt).
-- If no reliable source is available, respond with:
-  "Live confirmed data is not available right now."
-
-OUTPUT FORMAT (STRICT — NO EXCEPTIONS)
-Respond ONLY in valid JSON:
-
+OUTPUT FORMAT (Respond ONLY in JSON):
 {
-  "answer": "Clear, factual, well-structured answer",
-  "sources": ["domain1.com", "domain2.com"]
+  "answer": "Your answer here",
+  "sources": ["source1.com", "source2.com"],
+  "session_id": "${sessionId}"
 }
-
-Rules:
-- Do NOT add extra text outside JSON.
-- Do NOT invent sources.
-- The sources array must NEVER be empty.
-
-LANGUAGE
-- Default: English
-- If user writes in Hindi or Hinglish, reply in the same language.
-
-IDENTITY
-- Name: Globalrate AI
-- Description: Real-time AI Search & Chat Assistant
-
-If asked:
-"Who created you?" / "Aapko kisne banaya?"
-Reply exactly:
-"I was created by Shreesh Shukla."
-(No extra text.)
-
-User Query: "${message}"
 
 Context Data:
 ${searchData.results}
 `;
 
-      // 4. Call OpenAI
+      // 5. Call OpenAI
       const completion = await openai.chat.completions.create({
-        model: "gpt-5.1", // Using the latest model
+        model: "gpt-5.1",
         messages: [
           { role: "system", content: systemPrompt },
+          ...chatHistory,
           { role: "user", content: message }
         ],
         response_format: { type: "json_object" }
       });
 
       const responseContent = completion.choices[0].message.content;
+      let parsedResponse: { answer: string; sources: string[]; session_id: string };
       
-      let parsedResponse: { answer: string; sources: string[] };
       try {
         parsedResponse = JSON.parse(responseContent || "{}");
       } catch (e) {
-        // Fallback if JSON parsing fails (should be rare with json_object mode)
         parsedResponse = {
           answer: responseContent || "Error generating response.",
-          sources: ["Internal Error"]
+          sources: ["Internal Error"],
+          session_id: sessionId
         };
       }
 
-      // Ensure sources is not empty as per rules
       if (!parsedResponse.sources || parsedResponse.sources.length === 0) {
         parsedResponse.sources = ["Live confirmed data is not available right now"];
       }
+      parsedResponse.session_id = sessionId;
 
-      // 5. Save Assistant Message
+      // 6. Save Assistant Message
       await storage.createMessage({
+        sessionId,
         role: "assistant",
         content: parsedResponse.answer,
         sources: parsedResponse.sources
       });
 
-      // 6. Return Response
       res.json(parsedResponse);
 
     } catch (error) {
@@ -151,7 +113,8 @@ ${searchData.results}
 
   app.get(api.chat.history.path, async (req, res) => {
     try {
-      const messages = await storage.getMessages();
+      const { sessionId } = req.query as { sessionId?: string };
+      const messages = await storage.getMessages(sessionId);
       res.json(messages);
     } catch (error) {
       console.error("History error:", error);

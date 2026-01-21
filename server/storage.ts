@@ -4,12 +4,15 @@ import { messages, type Message, type InsertMessage } from "@shared/schema";
 import { eq, asc } from "drizzle-orm";
 
 export interface IStorage {
-  getMessages(): Promise<Message[]>;
+  getMessages(sessionId?: string): Promise<Message[]>;
   createMessage(message: InsertMessage): Promise<Message>;
 }
 
 export class DatabaseStorage implements IStorage {
-  async getMessages(): Promise<Message[]> {
+  async getMessages(sessionId?: string): Promise<Message[]> {
+    if (sessionId) {
+      return await db.select().from(messages).where(eq(messages.sessionId, sessionId)).orderBy(asc(messages.createdAt));
+    }
     return await db.select().from(messages).orderBy(asc(messages.createdAt));
   }
 
