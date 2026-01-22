@@ -12,22 +12,25 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
-async function getWikipediaData(query: string): Promise<string | null> {
+async function getDuckDuckGoData(query: string): Promise<string | null> {
   try {
-    const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&format=json&prop=extracts&exintro=1&explaintext=1&titles=${encodeURIComponent(query)}&origin=*`;
+    const searchUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const response = await fetch(searchUrl);
     const data = await response.json() as any;
     
-    const pages = data.query?.pages;
-    if (!pages) return null;
+    if (data.AbstractText) {
+      return data.AbstractText;
+    }
     
-    const pageId = Object.keys(pages)[0];
-    if (pageId === "-1") return null;
+    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+      // Find the first topic with a text property (some might be nested categories)
+      const firstTopic = data.RelatedTopics.find((t: any) => t.Text);
+      return firstTopic ? firstTopic.Text : null;
+    }
     
-    const extract = pages[pageId].extract;
-    return extract || null;
+    return null;
   } catch (error) {
-    console.error("Wikipedia API error:", error);
+    console.error("DuckDuckGo API error:", error);
     return null;
   }
 }
@@ -43,31 +46,33 @@ export async function registerRoutes(
       
       const sessionId = incomingSessionId || randomUUID();
 
-      // 1. Get Wikipedia Data
-      const wikipediaExtract = await getWikipediaData(message);
+      // 1. Get DuckDuckGo Data
+      const ddgData = await getDuckDuckGoData(message);
 
       // 2. Construct System Prompt
       let systemPrompt = "";
       let defaultSource = "";
 
-      if (wikipediaExtract) {
-        defaultSource = "wikipedia.org";
+      if (ddgData) {
+        defaultSource = "duckduckgo.com";
         systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
 
 CORE GOAL:
-You must ALWAYS return a helpful answer based strictly on the provided Wikipedia extract.
+You must ALWAYS return a helpful answer based on the provided data.
 You are NOT allowed to return an empty answer.
 
-DATA PRIORITY:
-Use the provided Wikipedia extract to generate a concise, factual answer.
+DATA SOURCE:
+DuckDuckGo Instant Answer: ${ddgData}
 
-WIKIPEDIA EXTRACT:
-${wikipediaExtract}
+STRICT RULES:
+- Answer ONLY using the provided data if possible.
+- Be concise, factual, and neutral.
+- Do not repeat the question.
 
 OUTPUT FORMAT (Respond ONLY in JSON):
 {
-  "answer": "Clear, helpful answer based on Wikipedia",
-  "sources": ["wikipedia.org"]
+  "answer": "Clear factual answer based on DuckDuckGo data",
+  "sources": ["duckduckgo.com"]
 }
 `;
       } else {
@@ -75,19 +80,17 @@ OUTPUT FORMAT (Respond ONLY in JSON):
         systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
 
 CORE GOAL:
-You must ALWAYS return a helpful answer using your general knowledge in a neutral, factual way.
+You must ALWAYS return a helpful answer using your general knowledge.
 You are NOT allowed to return an empty answer.
 
 STRICT RULES:
-- Never stay silent.
-- Never return an empty string.
-- Never say "I cannot answer" or similar.
-- State that the information may not be live-confirmed.
-- Start your answer with "Based on general knowledge, here is a reliable explanation."
+- Start the answer with: "Based on general knowledge,"
+- State that live confirmed data may not be available.
+- Be concise, factual, and neutral.
 
 OUTPUT FORMAT (Respond ONLY in JSON):
 {
-  "answer": "Clear, helpful answer based on general knowledge",
+  "answer": "Clear helpful answer based on general knowledge",
   "sources": ["Live confirmed data is not available right now"]
 }
 `;
@@ -110,14 +113,14 @@ OUTPUT FORMAT (Respond ONLY in JSON):
         parsedResponse = JSON.parse(responseContent || "{}");
       } catch (e) {
         parsedResponse = {
-          answer: responseContent || "Based on general knowledge, here is a reliable explanation.",
+          answer: responseContent || (ddgData ? "Processed answer based on search." : "Based on general knowledge, here is a reliable explanation."),
           sources: [defaultSource]
         };
       }
 
       // 4. Force source consistency
-      if (wikipediaExtract) {
-        parsedResponse.sources = ["wikipedia.org"];
+      if (ddgData) {
+        parsedResponse.sources = ["duckduckgo.com"];
       } else {
         parsedResponse.sources = ["Live confirmed data is not available right now"];
       }
