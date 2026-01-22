@@ -12,27 +12,22 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
-async function getDuckDuckGoData(query: string): Promise<string | null> {
+async function fetchWikipedia(query: string): Promise<{ text: string; url: string }> {
   try {
-    const searchUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const response = await fetch(searchUrl);
-    const data = await response.json() as any;
-    
-    if (data.AbstractText) {
-      return data.AbstractText;
+    const formattedQuery = query.trim().replace(/\s+/g, "_");
+    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(formattedQuery)}`;
+    const response = await fetch(url);
+    if (response.ok) {
+      const data = await response.json() as any;
+      return {
+        text: data.extract || "",
+        url: data.content_urls?.desktop?.page || ""
+      };
     }
-    
-    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-      // Find the first topic with a text property (some might be nested categories)
-      const firstTopic = data.RelatedTopics.find((t: any) => t.Text);
-      return firstTopic ? firstTopic.Text : null;
-    }
-    
-    return null;
   } catch (error) {
-    console.error("DuckDuckGo API error:", error);
-    return null;
+    console.error("Wikipedia fetch error:", error);
   }
+  return { text: "", url: "" };
 }
 
 export async function registerRoutes(
@@ -46,57 +41,40 @@ export async function registerRoutes(
       
       const sessionId = incomingSessionId || randomUUID();
 
-      // 1. Get DuckDuckGo Data
-      const ddgData = await getDuckDuckGoData(message);
+      // 1. Get History (Last 5 messages for context)
+      const history = await storage.getMessages(sessionId);
+      const recentHistory = history.slice(-5);
+      
+      // 2. Fetch Wikipedia Data
+      const wiki = await fetchWikipedia(message);
 
-      // 2. Construct System Prompt
-      let systemPrompt = "";
-      let defaultSource = "";
+      // 3. Construct System Prompt
+      let historyContext = "";
+      recentHistory.forEach(item => {
+        historyContext += `Q: ${item.content}\n`;
+        // Since we don't store role in content, we'd normally distinguish, 
+        // but for this specific pattern we'll just show the user messages 
+        // or refine if storage had roles (it does in DB)
+      });
 
-      if (ddgData) {
-        defaultSource = "duckduckgo.com";
-        systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
+      const systemPrompt = `You are Globalrate AI, a source-backed assistant.
+Maintain message history per sessionId.
+Do NOT mix messages between different sessions.
 
-CORE GOAL:
-You must ALWAYS return a helpful answer based on the provided data.
-You are NOT allowed to return an empty answer.
+CONVERSATION CONTEXT:
+${history.map(m => `${m.role.toUpperCase()}: ${m.content}`).slice(-5).join('\n')}
 
-DATA SOURCE:
-DuckDuckGo Instant Answer: ${ddgData}
-
-STRICT RULES:
-- Answer ONLY using the provided data if possible.
-- Be concise, factual, and neutral.
-- Do not repeat the question.
-
-OUTPUT FORMAT (Respond ONLY in JSON):
-{
-  "answer": "Clear factual answer based on DuckDuckGo data",
-  "sources": ["duckduckgo.com"]
-}
-`;
-      } else {
-        defaultSource = "Live confirmed data is not available right now";
-        systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
-
-CORE GOAL:
-You must ALWAYS return a helpful answer using your general knowledge.
-You are NOT allowed to return an empty answer.
-
-STRICT RULES:
-- Start the answer with: "Based on general knowledge,"
-- State that live confirmed data may not be available.
-- Be concise, factual, and neutral.
+WIKIPEDIA INFO:
+${wiki.text}
 
 OUTPUT FORMAT (Respond ONLY in JSON):
 {
-  "answer": "Clear helpful answer based on general knowledge",
-  "sources": ["Live confirmed data is not available right now"]
+  "answer": "Your detailed answer based on context and Wikipedia",
+  "sources": ["${wiki.url || "Live confirmed data is not available right now"}"]
 }
 `;
-      }
 
-      // 3. Call OpenAI
+      // 4. Call OpenAI
       const completion = await openai.chat.completions.create({
         model: "gpt-5.1",
         messages: [
@@ -113,16 +91,9 @@ OUTPUT FORMAT (Respond ONLY in JSON):
         parsedResponse = JSON.parse(responseContent || "{}");
       } catch (e) {
         parsedResponse = {
-          answer: responseContent || (ddgData ? "Processed answer based on search." : "Based on general knowledge, here is a reliable explanation."),
-          sources: [defaultSource]
+          answer: responseContent || "Error generating response.",
+          sources: wiki.url ? [wiki.url] : ["Live confirmed data is not available right now"]
         };
-      }
-
-      // 4. Force source consistency
-      if (ddgData) {
-        parsedResponse.sources = ["duckduckgo.com"];
-      } else {
-        parsedResponse.sources = ["Live confirmed data is not available right now"];
       }
 
       // 5. Save Messages
