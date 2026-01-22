@@ -12,11 +12,24 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
-async function performSearch(query: string): Promise<{ results: string; sources: string[] }> {
-  return {
-    results: "Live confirmed data is not available right now.",
-    sources: ["Live confirmed data is not available right now"]
-  };
+async function getWikipediaData(query: string): Promise<string | null> {
+  try {
+    const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&format=json&prop=extracts&exintro=1&explaintext=1&titles=${encodeURIComponent(query)}&origin=*`;
+    const response = await fetch(searchUrl);
+    const data = await response.json() as any;
+    
+    const pages = data.query?.pages;
+    if (!pages) return null;
+    
+    const pageId = Object.keys(pages)[0];
+    if (pageId === "-1") return null;
+    
+    const extract = pages[pageId].extract;
+    return extract || null;
+  } catch (error) {
+    console.error("Wikipedia API error:", error);
+    return null;
+  }
 }
 
 export async function registerRoutes(
@@ -28,52 +41,62 @@ export async function registerRoutes(
     try {
       const { message, sessionId: incomingSessionId } = api.chat.send.input.parse(req.body);
       
-      // SESSION HANDLING: Auto-generate if missing
       const sessionId = incomingSessionId || randomUUID();
 
-      // 1. Get Session History (Follow-up within session)
-      const history = await storage.getMessages(sessionId);
-      const chatHistory = history.map(msg => ({
-        role: msg.role as "user" | "assistant",
-        content: msg.content
-      }));
+      // 1. Get Wikipedia Data (Real-time data gathering)
+      const wikipediaExtract = await getWikipediaData(message);
 
-      // 2. Save User Message
-      await storage.createMessage({
-        sessionId,
-        role: "user",
-        content: message,
-        sources: null
-      });
+      // 2. Fail-safe for missing data
+      if (!wikipediaExtract) {
+        const response = {
+          answer: "Live confirmed data is not available right now.",
+          sources: ["wikipedia.org"]
+        };
+        
+        await storage.createMessage({
+          sessionId,
+          role: "user",
+          content: message,
+          sources: null
+        });
 
-      // 3. Perform Search
-      const searchData = await performSearch(message);
+        await storage.createMessage({
+          sessionId,
+          role: "assistant",
+          content: response.answer,
+          sources: response.sources
+        });
 
-      // 4. Construct System Prompt
-      const systemPrompt = `You are Globalrate AI, a real-time AI search and chat assistant. 
+        return res.json({
+          ...response,
+          session_id: sessionId
+        });
+      }
 
-SESSION RULES:
-- Every chat message MUST belong to a session.
-- Maintain full conversation context inside the same session.
-- Do NOT share context across different sessions.
-- If asked who created you, reply exactly: "I was created by Shreesh Shukla."
+      // 3. Construct System Prompt (Strict Wikipedia enforcement)
+      const systemPrompt = `You are Globalrate AI, a real-time search and answer assistant.
 
-OUTPUT FORMAT (Respond ONLY in JSON):
+CORE BEHAVIOR:
+- Answer ONLY using the provided Wikipedia extract.
+- Be concise, factual, and neutral.
+- Do not hallucinate, guess, or add outside knowledge.
+- Do not repeat the question.
+
+WIKIPEDIA EXTRACT:
+${wikipediaExtract}
+
+OUTPUT FORMAT (Respond ONLY in valid JSON):
 {
-  "answer": "Your answer here",
-  "sources": ["domain1.com", "domain2.com"]
+  "answer": "Concise factual answer based strictly on Wikipedia extract",
+  "sources": ["wikipedia.org"]
 }
-
-Context Data:
-${searchData.results}
 `;
 
-      // 5. Call OpenAI
+      // 4. Call OpenAI
       const completion = await openai.chat.completions.create({
         model: "gpt-5.1",
         messages: [
           { role: "system", content: systemPrompt },
-          ...chatHistory,
           { role: "user", content: message }
         ],
         response_format: { type: "json_object" }
@@ -87,15 +110,21 @@ ${searchData.results}
       } catch (e) {
         parsedResponse = {
           answer: responseContent || "Error generating response.",
-          sources: ["Internal Error"]
+          sources: ["wikipedia.org"]
         };
       }
 
-      if (!parsedResponse.sources || parsedResponse.sources.length === 0) {
-        parsedResponse.sources = ["Live confirmed data is not available right now"];
-      }
+      // 5. Final check on sources as per rules
+      parsedResponse.sources = ["wikipedia.org"];
 
-      // 6. Save Assistant Message
+      // 6. Save Messages
+      await storage.createMessage({
+        sessionId,
+        role: "user",
+        content: message,
+        sources: null
+      });
+
       await storage.createMessage({
         sessionId,
         role: "assistant",
@@ -103,7 +132,7 @@ ${searchData.results}
         sources: parsedResponse.sources
       });
 
-      // Include session_id in JSON response for client
+      // 7. Return Response
       res.json({
         ...parsedResponse,
         session_id: sessionId
