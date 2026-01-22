@@ -43,56 +43,57 @@ export async function registerRoutes(
       
       const sessionId = incomingSessionId || randomUUID();
 
-      // 1. Get Wikipedia Data (Real-time data gathering)
+      // 1. Get Wikipedia Data
       const wikipediaExtract = await getWikipediaData(message);
 
-      // 2. Fail-safe for missing data
-      if (!wikipediaExtract) {
-        const response = {
-          answer: "Live confirmed data is not available right now.",
-          sources: ["wikipedia.org"]
-        };
-        
-        await storage.createMessage({
-          sessionId,
-          role: "user",
-          content: message,
-          sources: null
-        });
+      // 2. Construct System Prompt
+      let systemPrompt = "";
+      let defaultSource = "";
 
-        await storage.createMessage({
-          sessionId,
-          role: "assistant",
-          content: response.answer,
-          sources: response.sources
-        });
+      if (wikipediaExtract) {
+        defaultSource = "wikipedia.org";
+        systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
 
-        return res.json({
-          ...response,
-          session_id: sessionId
-        });
-      }
+CORE GOAL:
+You must ALWAYS return a helpful answer based strictly on the provided Wikipedia extract.
+You are NOT allowed to return an empty answer.
 
-      // 3. Construct System Prompt (Strict Wikipedia enforcement)
-      const systemPrompt = `You are Globalrate AI, a real-time search and answer assistant.
-
-CORE BEHAVIOR:
-- Answer ONLY using the provided Wikipedia extract.
-- Be concise, factual, and neutral.
-- Do not hallucinate, guess, or add outside knowledge.
-- Do not repeat the question.
+DATA PRIORITY:
+Use the provided Wikipedia extract to generate a concise, factual answer.
 
 WIKIPEDIA EXTRACT:
 ${wikipediaExtract}
 
-OUTPUT FORMAT (Respond ONLY in valid JSON):
+OUTPUT FORMAT (Respond ONLY in JSON):
 {
-  "answer": "Concise factual answer based strictly on Wikipedia extract",
+  "answer": "Clear, helpful answer based on Wikipedia",
   "sources": ["wikipedia.org"]
 }
 `;
+      } else {
+        defaultSource = "Live confirmed data is not available right now";
+        systemPrompt = `You are Globalrate AI, a reliable AI search and chat assistant.
 
-      // 4. Call OpenAI
+CORE GOAL:
+You must ALWAYS return a helpful answer using your general knowledge in a neutral, factual way.
+You are NOT allowed to return an empty answer.
+
+STRICT RULES:
+- Never stay silent.
+- Never return an empty string.
+- Never say "I cannot answer" or similar.
+- State that the information may not be live-confirmed.
+- Start your answer with "Based on general knowledge, here is a reliable explanation."
+
+OUTPUT FORMAT (Respond ONLY in JSON):
+{
+  "answer": "Clear, helpful answer based on general knowledge",
+  "sources": ["Live confirmed data is not available right now"]
+}
+`;
+      }
+
+      // 3. Call OpenAI
       const completion = await openai.chat.completions.create({
         model: "gpt-5.1",
         messages: [
@@ -109,15 +110,19 @@ OUTPUT FORMAT (Respond ONLY in valid JSON):
         parsedResponse = JSON.parse(responseContent || "{}");
       } catch (e) {
         parsedResponse = {
-          answer: responseContent || "Error generating response.",
-          sources: ["wikipedia.org"]
+          answer: responseContent || "Based on general knowledge, here is a reliable explanation.",
+          sources: [defaultSource]
         };
       }
 
-      // 5. Final check on sources as per rules
-      parsedResponse.sources = ["wikipedia.org"];
+      // 4. Force source consistency
+      if (wikipediaExtract) {
+        parsedResponse.sources = ["wikipedia.org"];
+      } else {
+        parsedResponse.sources = ["Live confirmed data is not available right now"];
+      }
 
-      // 6. Save Messages
+      // 5. Save Messages
       await storage.createMessage({
         sessionId,
         role: "user",
@@ -132,7 +137,7 @@ OUTPUT FORMAT (Respond ONLY in valid JSON):
         sources: parsedResponse.sources
       });
 
-      // 7. Return Response
+      // 6. Return Response
       res.json({
         ...parsedResponse,
         session_id: sessionId
